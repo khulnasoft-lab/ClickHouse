@@ -3,11 +3,6 @@
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int LOGICAL_ERROR;
-}
-
 CopyTransform::CopyTransform(const Block & header, size_t num_outputs)
     : IProcessor(InputPorts(1, header), OutputPorts(num_outputs, header))
 {
