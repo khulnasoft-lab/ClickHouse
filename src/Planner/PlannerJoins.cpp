@@ -287,6 +287,8 @@ public:
 
     static QueryTreeNodePtr apply(const QueryTreeNodePtr & node, const JoinNode & join_node, const ContextPtr & context)
     {
+        if (!context->getSettingsRef()[Setting::join_use_nulls])
+            return node;
         ColumnsToNullableVisitor visitor(join_node, context);
         auto result_node = node->clone();
         visitor.visit(result_node);
