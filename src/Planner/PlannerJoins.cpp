@@ -19,6 +19,7 @@
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
+#include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/IQueryTreeNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -247,6 +248,58 @@ const ActionsDAG::Node * appendExpression(
     return join_expression_dag_node_raw_pointers[0];
 }
 
+class ColumnsToNullableVisitor final : public InDepthQueryTreeVisitor<ColumnsToNullableVisitor>
+{
+public:
+    ColumnsToNullableVisitor(const JoinNode & join_node, const ContextPtr & context_)
+        : context(context_)
+        , left_table_expression(join_node.getLeftTableExpression().get())
+        , right_table_expression(join_node.getRightTableExpression().get())
+        , join_kind(join_node.getKind())
+    {
+    }
+
+    bool shouldTraverseTopToBottom() const { return false; }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        std::optional<JoinTableSide> table_side;
+        if (const auto * column_node = node->as<ColumnNode>())
+        {
+            const auto * column_src = column_node->getColumnSource().get();
+            if (left_table_expression == column_src)
+                table_side.emplace(JoinTableSide::Left);
+            if (right_table_expression == column_src)
+                table_side.emplace(JoinTableSide::Right);
+        }
+
+        if (table_side)
+        {
+            auto nullable_node = applyJoinUseNullsForColumn(node, join_kind, table_side, context);
+            if (nullable_node)
+                node = nullable_node;
+        }
+
+        auto * function_node = node->as<FunctionNode>();
+        if (function_node)
+            rerunFunctionResolve(function_node, context);
+    }
+
+    static QueryTreeNodePtr apply(const QueryTreeNodePtr & node, const JoinNode & join_node, const ContextPtr & context)
+    {
+        ColumnsToNullableVisitor visitor(join_node, context);
+        auto result_node = node->clone();
+        visitor.visit(result_node);
+        return result_node;
+    }
+
+private:
+    const ContextPtr & context;
+    const IQueryTreeNode * left_table_expression;
+    const IQueryTreeNode * right_table_expression;
+    JoinKind join_kind;
+};
+
 void buildJoinClauseImpl(
     ActionsDAG & left_dag,
     ActionsDAG & right_dag,
@@ -351,25 +404,9 @@ void buildJoinClauseImpl(
         }
         else
         {
-            auto support_mixed_join_condition
-                = planner_context->getQueryContext()->getSettingsRef()[Setting::allow_experimental_join_condition];
-            auto join_use_nulls = planner_context->getQueryContext()->getSettingsRef()[Setting::join_use_nulls];
-            /// If join_use_nulls = true, the columns' nullability will be changed later which make this expression not right.
-            if (support_mixed_join_condition && !join_use_nulls)
-            {
-                /// expression involves both tables.
-                /// `expr1(left.col1, right.col2) == expr2(left.col3, right.col4)`
-                const auto * node = appendExpression(joined_dag, join_expression, planner_context, join_node);
-                join_clause.addResidualCondition(node);
-            }
-            else
-            {
-                throw Exception(
-                    ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
-                    "{} JOIN ON expression {} contains column from left and right table, which is not supported with `join_use_nulls`",
-                    toString(join_node.getKind()),
-                    join_expression->formatASTForErrorMessage());
-            }
+            auto nullable_join_expression = ColumnsToNullableVisitor::apply(join_expression, join_node, planner_context->getQueryContext());
+            const auto * node = appendExpression(joined_dag, nullable_join_expression, planner_context, join_node);
+            join_clause.addResidualCondition(node);
         }
     }
     else
@@ -386,25 +423,9 @@ void buildJoinClauseImpl(
         }
         else
         {
-            auto join_use_nulls = planner_context->getQueryContext()->getSettingsRef()[Setting::join_use_nulls];
-            /// If join_use_nulls = true, the columns' nullability will be changed later which make this expression not applicable.
-            auto strictness = join_node.getStrictness();
-            auto kind = join_node.getKind();
-            bool can_be_moved_out
-                = strictness == JoinStrictness::All && (kind == JoinKind::Inner || kind == JoinKind::Cross || kind == JoinKind::Comma);
-            if (can_be_moved_out || !join_use_nulls)
-            {
-                const auto * node = appendExpression(joined_dag, join_expression, planner_context, join_node);
-                join_clause.addResidualCondition(node);
-            }
-            else
-            {
-                throw Exception(
-                    ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
-                    "{} JOIN ON expression {} contains column from left and right table, which is not supported with `join_use_nulls`",
-                    toString(join_node.getKind()),
-                    join_expression->formatASTForErrorMessage());
-            }
+            auto nullable_join_expression = ColumnsToNullableVisitor::apply(join_expression, join_node, planner_context->getQueryContext());
+            const auto * node = appendExpression(joined_dag, nullable_join_expression, planner_context, join_node);
+            join_clause.addResidualCondition(node);
         }
     }
 }
@@ -718,13 +739,19 @@ JoinClausesAndActions buildJoinClausesAndActions(
     ActionsDAG left_join_actions(left_table_expression_columns);
     ActionsDAG right_join_actions(right_table_expression_columns);
     ColumnsWithTypeAndName result_relation_columns;
+    const auto & settings = planner_context->getQueryContext()->getSettingsRef();
+    bool join_use_nulls = settings[Setting::join_use_nulls];
     for (const auto & left_column : left_table_expression_columns)
     {
-        result_relation_columns.push_back(left_column);
+        auto & column = result_relation_columns.emplace_back(left_column);
+        if (join_use_nulls && isRightOrFull(join_node.getKind()))
+            JoinCommon::convertColumnToNullable(column);
     }
     for (const auto & right_column : right_table_expression_columns)
     {
-        result_relation_columns.push_back(right_column);
+        auto & column = result_relation_columns.emplace_back(right_column);
+        if (join_use_nulls && isLeftOrFull(join_node.getKind()))
+            JoinCommon::convertColumnToNullable(column);
     }
     ActionsDAG post_join_actions(result_relation_columns);
 
@@ -906,8 +933,9 @@ JoinClausesAndActions buildJoinClausesAndActions(
         if (result.join_clauses.size() > 1)
         {
             ActionsDAG residual_join_expressions_actions(result_relation_columns);
+            auto nullable_join_expression = ColumnsToNullableVisitor::apply(join_expression, join_node, planner_context->getQueryContext());
             PlannerActionsVisitor join_expression_visitor(planner_context);
-            auto join_expression_dag_node_raw_pointers = join_expression_visitor.visit(residual_join_expressions_actions, join_expression);
+            auto join_expression_dag_node_raw_pointers = join_expression_visitor.visit(residual_join_expressions_actions, nullable_join_expression);
             if (join_expression_dag_node_raw_pointers.size() != 1)
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR, "JOIN {} ON clause contains multiple expressions", join_node.formatASTForErrorMessage());
